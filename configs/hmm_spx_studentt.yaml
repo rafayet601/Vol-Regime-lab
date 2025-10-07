@@ -24,7 +24,7 @@ model:
 training:
   algorithm: "baum_welch"
   max_iterations: 100
-  tolerance: 1e-6
+  tolerance: 0.000001
   random_seed: 42
   
 output:
