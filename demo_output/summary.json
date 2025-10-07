@@ -1,0 +1,16 @@
+{
+  "model": "Student-t HMM",
+  "n_states": 2,
+  "n_observations": 754,
+  "n_features": 2,
+  "date_range": {
+    "start": "2020-12-31",
+    "end": "2023-12-29"
+  },
+  "regime_distribution": {
+    "state_0_pct": 35.94164456233422,
+    "state_1_pct": 64.05835543766578
+  },
+  "transitions": 183,
+  "avg_duration_days": 4.0978260869565215
+}
