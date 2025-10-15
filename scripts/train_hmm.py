@@ -60,10 +60,14 @@ def load_and_prepare_data(config: Dict) -> pd.DataFrame:
         returns_column=config["features"]["returns_column"]
     )
     
+    # Get volatility method from config (default to 'std')
+    volatility_method = config["features"].get("volatility_method", "std")
+    
     feature_data = feature_engineer.engineer_features(
         returns_data,
         rolling_window=config["features"]["rolling_window"],
-        additional_features=config["features"]["additional_features"]
+        additional_features=config["features"]["additional_features"],
+        volatility_method=volatility_method
     )
     
     # Validate features

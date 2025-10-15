@@ -1,0 +1,41 @@
+{
+  "separation": {
+    "regime_0_mean_vol": NaN,
+    "regime_0_std_vol": NaN,
+    "regime_1_mean_vol": NaN,
+    "regime_1_std_vol": NaN,
+    "mean_difference": NaN,
+    "relative_difference_pct": NaN,
+    "t_statistic": NaN,
+    "p_value": NaN,
+    "cohens_d": NaN,
+    "overlap_coefficient": NaN
+  },
+  "confidence": {
+    "avg_confidence": 1.0,
+    "median_confidence": 1.0,
+    "min_confidence": 1.0,
+    "uncertain_predictions_pct": 0.0,
+    "very_confident_pct": 100.0
+  },
+  "forward_5d": {
+    "regime_0_future_vol_5d": NaN,
+    "regime_1_future_vol_5d": NaN,
+    "prediction_accuracy": NaN,
+    "prediction_correlation": NaN
+  },
+  "forward_20d": {
+    "regime_0_future_vol_20d": NaN,
+    "regime_1_future_vol_20d": NaN,
+    "prediction_accuracy": NaN,
+    "prediction_correlation": NaN
+  },
+  "timing": {
+    "regime_vol_change_correlation": NaN,
+    "avg_vol_change_at_transition": NaN,
+    "avg_vol_change_normal": NaN,
+    "transition_sensitivity": 0
+  },
+  "economic": {},
+  "overall_score": "1/5"
+}
