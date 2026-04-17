@@ -115,12 +115,11 @@ class VolTargetingStrategy:
 
         position_t = vol_target / vol_forecast_t
 
-    vol_forecast_t is regime-weighted realised vol from the HMM params:
-
-        σ_forecast = Σ_k P(state k)_t × ||σ_k||₂ / sqrt(d)
-
-    This is the standard Citadel / Millennium approach: maintain a
-    constant ex-ante risk budget regardless of market regime.
+    Since heterogeneous features (VRP, term structure ratios, etc.) are 
+    Z-scored and non-uniform, we cannot infer return volatility directly 
+    from the HMM's feature emission standard deviations. Instead, we use 
+    empirical priors for the state volatilities (e.g., 12% for calm, 
+    25% for turbulent).
 
     Parameters
     ----------
@@ -128,27 +127,32 @@ class VolTargetingStrategy:
         Annualised volatility target (e.g. 0.10 = 10%).
     max_leverage : float
         Maximum allowed position size (default 2.0×).
+    state_vols : list of float
+        Empirical annualized volatility expected for each state 
+        (e.g., [0.12, 0.25] for a 2-state model).
     """
 
-    def __init__(self, vol_target: float = 0.10, max_leverage: float = 2.0):
+    def __init__(self, vol_target: float = 0.10, max_leverage: float = 2.0, state_vols: list = [0.12, 0.25]):
         self.vol_target   = vol_target
         self.max_leverage = max_leverage
+        self.state_vols   = np.array(state_vols)
 
-    def __call__(self, probs: np.ndarray, params) -> np.ndarray:
+    def __call__(self, probs: np.ndarray, params=None) -> np.ndarray:
         """
         Parameters
         ----------
         probs  : (T, K)
-        params : StudentTHMMParams  — used for σ_k to compute vol forecast
+        params : StudentTHMMParams (unused, kept for interface compatibility)
         """
-        K = probs.shape[1]
-        d = params.sigma.shape[1]
-
-        # Per-state annualised vol estimate: L2-norm of σ_k / sqrt(d) * sqrt(252)
-        state_vols = np.linalg.norm(params.sigma, axis=1) / np.sqrt(d) * np.sqrt(252)
+        # Ensure state_vols matches the number of states provided in probs
+        if len(self.state_vols) != probs.shape[1]:
+            # Fallback scaling if K changes unexpectedly
+            vols = np.linspace(0.12, 0.30, probs.shape[1])
+        else:
+            vols = self.state_vols
 
         # Regime-weighted vol forecast per time step
-        vol_forecast = probs @ state_vols       # (T,)
+        vol_forecast = probs @ vols       # (T,)
         vol_forecast = np.maximum(vol_forecast, 1e-6)
 
         position = self.vol_target / vol_forecast
@@ -158,6 +162,7 @@ class VolTargetingStrategy:
 
     def __repr__(self):
         return f"VolTargetingStrategy(vol_target={self.vol_target}, max_lev={self.max_leverage})"
+
 
 
 # ---------------------------------------------------------------------------
