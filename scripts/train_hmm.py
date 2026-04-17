@@ -1,11 +1,17 @@
 #!/usr/bin/env python3
-"""Training script for S&P 500 Student-t HMM with Baum-Welch algorithm."""
+"""
+Training script for S&P 500 Student-t HMM with Baum-Welch algorithm.
+
+v2.0 — Uses the functional feature API (build_features, get_feature_cols)
+instead of the legacy FeatureEngineer class.
+"""
 
 import argparse
 import logging
 import sys
+import time
 from pathlib import Path
-from typing import Dict, Optional
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
@@ -13,10 +19,14 @@ import pandas as pd
 # Add src to path for imports
 sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 
-from regime_lab.data.features import FeatureEngineer
-from regime_lab.data.loader import SPXDataLoader
-from regime_lab.models.hmm_studentt import StudentTHMM
-from regime_lab.utils.config import ensure_dir, get_timestamp, load_config, save_json
+from regime_lab.data.features import (
+    build_features,
+    get_feature_cols,
+    load_spx_data,
+    load_vix_data,
+)
+from regime_lab.models.hmm_studentt import StudentTHMM, select_n_states
+from regime_lab.utils.config import ensure_dir, get_timestamp, save_json
 from regime_lab.utils.io import save_dataframe, save_pickle
 
 
@@ -32,215 +42,206 @@ def setup_logging(log_level: str = "INFO") -> None:
     )
 
 
-def load_and_prepare_data(config: Dict) -> pd.DataFrame:
-    """Load and prepare S&P 500 data with features.
-    
-    Args:
-        config: Configuration dictionary
-        
-    Returns:
-        DataFrame with engineered features
+def load_and_prepare_data(
+    symbol: str = "^GSPC",
+    start_date: str = "2005-01-01",
+    end_date: Optional[str] = None,
+    tier: int = 2,
+) -> Tuple[pd.DataFrame, List[str]]:
+    """Load and prepare S&P 500 data with v2.0 feature engineering.
+
+    Parameters
+    ----------
+    symbol : str
+        Ticker symbol (only ^GSPC supported by `load_spx_data`).
+    start_date, end_date : str
+        Date range for data retrieval.
+    tier : int
+        Feature tier (1=SPX only, 2=+VIX, 3=full).
+
+    Returns
+    -------
+    features : DataFrame
+        Feature matrix with all tiers available.
+    feature_cols : list of str
+        Selected feature column names for this tier.
     """
     logger = logging.getLogger(__name__)
-    
-    # Initialize data loader
-    loader = SPXDataLoader(cache_dir=config["data"]["cache_dir"])
-    
-    # Load price and returns data
+
+    # --- Load SPX prices + returns ---
     logger.info("Loading S&P 500 data...")
-    price_data, returns_data = loader.get_full_dataset(
-        symbol=config["data"]["symbol"],
-        start_date=config["data"]["start_date"],
-        end_date=config["data"]["end_date"]
+    prices, returns = load_spx_data(start_date=start_date, end_date=end_date)
+
+    # --- Optionally load VIX data for Tier 2+ features ---
+    vix_df = None
+    if tier >= 2:
+        logger.info("Loading VIX data for Tier 2+ features...")
+        try:
+            vix_df = load_vix_data(start_date=start_date, end_date=end_date)
+        except Exception as exc:
+            logger.warning(f"VIX data unavailable ({exc}); falling back to Tier 1.")
+            tier = 1
+
+    # --- Build feature matrix ---
+    logger.info("Building feature matrix...")
+    features = build_features(returns, prices=prices, vix_df=vix_df)
+    feature_cols = get_feature_cols(features, tier=tier)
+
+    logger.info(
+        f"Data preparation complete: {len(features)} observations, "
+        f"{len(feature_cols)} features (Tier {tier})"
     )
-    
-    # Engineer features
-    logger.info("Engineering features...")
-    feature_engineer = FeatureEngineer(
-        returns_column=config["features"]["returns_column"]
-    )
-    
-    # Get volatility method from config (default to 'std')
-    volatility_method = config["features"].get("volatility_method", "std")
-    
-    feature_data = feature_engineer.engineer_features(
-        returns_data,
-        rolling_window=config["features"]["rolling_window"],
-        additional_features=config["features"]["additional_features"],
-        volatility_method=volatility_method
-    )
-    
-    # Validate features
-    feature_columns = feature_engineer.get_feature_names(feature_data)
-    if not feature_engineer.validate_features(feature_data, feature_columns):
-        raise ValueError("Feature validation failed")
-    
-    logger.info(f"Data preparation complete: {len(feature_data)} observations, {len(feature_columns)} features")
-    
-    return feature_data, feature_columns
+    return features, feature_cols
 
 
 def train_hmm_model(
     data: pd.DataFrame,
-    feature_columns: list,
-    config: Dict
+    feature_columns: List[str],
+    n_states: int = 2,
+    fix_nu: bool = False,
+    max_iter: int = 200,
+    tol: float = 1e-6,
+    random_seed: int = 42,
 ) -> StudentTHMM:
     """Train the Student-t HMM model.
-    
-    Args:
-        data: DataFrame with features
-        feature_columns: List of feature column names
-        config: Configuration dictionary
-        
-    Returns:
-        Trained HMM model
+
+    Parameters
+    ----------
+    data : DataFrame
+        Feature matrix produced by build_features().
+    feature_columns : list of str
+        Which columns to feed into the HMM.
+    n_states, fix_nu, max_iter, tol, random_seed
+        StudentTHMM constructor parameters.
+
+    Returns
+    -------
+    Trained StudentTHMM instance.
     """
     logger = logging.getLogger(__name__)
-    
-    # Prepare training data
+
     X = data[feature_columns].values
-    
-    # Initialize and train model
-    logger.info("Initializing Student-t HMM...")
+
+    logger.info(f"Initializing Student-t HMM (K={n_states}, fix_nu={fix_nu})...")
     model = StudentTHMM(
-        n_states=config["model"]["n_states"],
-        n_features=len(feature_columns),
-        df=5.0,  # Fixed degrees of freedom
-        random_seed=config["training"]["random_seed"]
+        n_states=n_states,
+        fix_nu=fix_nu,
+        max_iter=max_iter,
+        tol=tol,
+        random_seed=random_seed,
     )
-    
+
     logger.info("Training HMM with Baum-Welch algorithm...")
-    model.fit(
-        X,
-        max_iterations=config["training"]["max_iterations"],
-        tolerance=config["training"]["tolerance"],
-        verbose=True
+    start = time.time()
+    model.fit(X)
+    elapsed = time.time() - start
+
+    logger.info(
+        f"HMM training completed in {elapsed:.1f}s "
+        f"(converged={model.params_.converged}, iter={model.params_.n_iter})"
     )
-    
-    logger.info("HMM training completed successfully")
     return model
 
 
 def generate_predictions(
     model: StudentTHMM,
     data: pd.DataFrame,
-    feature_columns: list
+    feature_columns: List[str],
 ) -> Dict[str, pd.DataFrame]:
     """Generate predictions and probabilities from the trained model.
-    
-    Args:
-        model: Trained HMM model
-        data: DataFrame with features
-        feature_columns: List of feature column names
-        
-    Returns:
-        Dictionary containing prediction results
+
+    Returns
+    -------
+    dict with keys 'predictions' and 'features'.
     """
     logger = logging.getLogger(__name__)
-    
-    # Prepare data
+
     X = data[feature_columns].values
-    
-    # Generate predictions
-    logger.info("Generating state predictions...")
-    predicted_states = model.predict_states(X)
-    
-    logger.info("Computing state probabilities...")
+
+    logger.info("Generating Viterbi state predictions...")
+    predicted_states = model.predict(X)
+
+    logger.info("Computing posterior state probabilities...")
     state_probabilities = model.predict_proba(X)
-    
-    # Create results DataFrames
-    predictions_df = pd.DataFrame({
-        "date": data.index,
-        "predicted_state": predicted_states,
-        "state_0_prob": state_probabilities[:, 0],
-        "state_1_prob": state_probabilities[:, 1]
-    })
-    
-    # Add feature data for analysis
+
+    K = state_probabilities.shape[1]
+    predictions_df = pd.DataFrame(
+        {"date": data.index, "predicted_state": predicted_states},
+    )
+    for k in range(K):
+        predictions_df[f"state_{k}_prob"] = state_probabilities[:, k]
+
     features_df = data[feature_columns].copy()
     features_df.index.name = "date"
-    
+
     results = {
         "predictions": predictions_df,
-        "features": features_df
+        "features": features_df,
     }
-    
+
     logger.info(f"Generated predictions for {len(predictions_df)} observations")
-    
     return results
 
 
 def save_results(
     model: StudentTHMM,
     predictions: Dict[str, pd.DataFrame],
-    config: Dict,
-    output_dir: str
+    feature_cols: List[str],
+    output_dir: str,
 ) -> None:
-    """Save training results and model artifacts.
-    
-    Args:
-        model: Trained HMM model
-        predictions: Prediction results
-        config: Configuration dictionary
-        output_dir: Output directory for artifacts
-    """
+    """Save training results and model artifacts."""
     logger = logging.getLogger(__name__)
-    
-    # Ensure output directory exists
+
     ensure_dir(output_dir)
-    
-    # Save model parameters
+
+    # Model parameters JSON
     model_summary = model.get_model_summary()
-    model_summary["training_config"] = config
+    model_summary["feature_cols"] = feature_cols
     model_summary["timestamp"] = get_timestamp()
-    
+
     params_file = Path(output_dir) / "params.json"
     save_json(model_summary, str(params_file))
     logger.info(f"Saved model parameters to {params_file}")
-    
-    # Save model object
-    model_file = Path(output_dir) / "model.pkl"
-    model.save_model(str(model_file))
-    logger.info(f"Saved model object to {model_file}")
-    
-    # Save predictions
+
+    # Predictions CSV (posteriors.csv — expected by plot_regimes / evaluate)
     predictions_file = Path(output_dir) / "posteriors.csv"
     save_dataframe(predictions["predictions"], str(predictions_file))
     logger.info(f"Saved predictions to {predictions_file}")
-    
-    # Save features
+
+    # Features CSV
     features_file = Path(output_dir) / "features.csv"
     save_dataframe(predictions["features"], str(features_file))
     logger.info(f"Saved features to {features_file}")
-    
-    # Save Viterbi path (state sequence)
+
+    # Viterbi path CSV
     viterbi_file = Path(output_dir) / "viterbi.csv"
-    viterbi_df = pd.DataFrame({
-        "date": predictions["predictions"]["date"],
-        "state": predictions["predictions"]["predicted_state"],
-        "state_0_prob": predictions["predictions"]["state_0_prob"],
-        "state_1_prob": predictions["predictions"]["state_1_prob"]
-    })
+    viterbi_df = predictions["predictions"][
+        ["date", "predicted_state"]
+        + [c for c in predictions["predictions"].columns if c.endswith("_prob")]
+    ].copy()
     save_dataframe(viterbi_df, str(viterbi_file))
     logger.info(f"Saved Viterbi path to {viterbi_file}")
-    
-    # Create run summary
+
+    # Run summary JSON
     run_summary = {
         "timestamp": get_timestamp(),
-        "config_file": "hmm_spx_studentt.yaml",
         "model_type": "Student-t HMM",
-        "n_states": config["model"]["n_states"],
+        "n_states": model.n_states,
         "n_observations": len(predictions["predictions"]),
         "n_features": len(predictions["features"].columns),
+        "feature_cols": feature_cols,
+        "log_likelihood": model.params_.log_likelihood,
+        "bic": model.params_.bic,
+        "converged": model.params_.converged,
+        "n_iter": model.params_.n_iter,
         "files": {
             "params": str(params_file),
-            "model": str(model_file),
             "posteriors": str(predictions_file),
             "features": str(features_file),
-            "viterbi": str(viterbi_file)
-        }
+            "viterbi": str(viterbi_file),
+        },
     }
-    
+
     summary_file = Path(output_dir) / "last_run.json"
     save_json(run_summary, str(summary_file))
     logger.info(f"Saved run summary to {summary_file}")
@@ -250,63 +251,113 @@ def main():
     """Main training function."""
     parser = argparse.ArgumentParser(description="Train S&P 500 Student-t HMM")
     parser.add_argument(
-        "--config",
-        type=str,
-        default="configs/hmm_spx_studentt.yaml",
-        help="Path to configuration file"
+        "--start-date", type=str, default="2005-01-01",
+        help="Start date for data (YYYY-MM-DD)"
     )
     parser.add_argument(
-        "--output-dir",
-        type=str,
-        default="artifacts",
+        "--end-date", type=str, default=None,
+        help="End date for data (YYYY-MM-DD, default: today)"
+    )
+    parser.add_argument(
+        "--tier", type=int, default=2, choices=[1, 2, 3],
+        help="Feature tier (1=SPX, 2=+VIX, 3=full)"
+    )
+    parser.add_argument(
+        "--n-states", type=int, default=2,
+        help="Number of hidden states K"
+    )
+    parser.add_argument(
+        "--auto-select-k", action="store_true",
+        help="Automatically select K via BIC from {2,3,4}"
+    )
+    parser.add_argument(
+        "--fix-nu", action="store_true",
+        help="Fix degrees of freedom (do not learn ν)"
+    )
+    parser.add_argument(
+        "--max-iter", type=int, default=200,
+        help="Maximum EM iterations"
+    )
+    parser.add_argument(
+        "--tol", type=float, default=1e-6,
+        help="Convergence tolerance"
+    )
+    parser.add_argument(
+        "--seed", type=int, default=42,
+        help="Random seed"
+    )
+    parser.add_argument(
+        "--output-dir", type=str, default="artifacts",
         help="Output directory for artifacts"
     )
     parser.add_argument(
-        "--log-level",
-        type=str,
-        default="INFO",
+        "--log-level", type=str, default="INFO",
         choices=["DEBUG", "INFO", "WARNING", "ERROR"],
         help="Logging level"
     )
-    
+
     args = parser.parse_args()
-    
-    # Set up logging
+
     setup_logging(args.log_level)
     logger = logging.getLogger(__name__)
-    
+
     try:
-        logger.info("Starting HMM training pipeline...")
-        
-        # Load configuration
-        logger.info(f"Loading configuration from {args.config}")
-        config = load_config(args.config)
-        
+        logger.info("Starting HMM training pipeline (v2.0)...")
+
         # Load and prepare data
-        feature_data, feature_columns = load_and_prepare_data(config)
-        
+        features, feature_cols = load_and_prepare_data(
+            start_date=args.start_date,
+            end_date=args.end_date,
+            tier=args.tier,
+        )
+
+        # Determine number of states
+        n_states = args.n_states
+        if args.auto_select_k:
+            logger.info("Auto-selecting K via BIC...")
+            X_sel = features[feature_cols].values
+            n_states, bic_val = select_n_states(
+                X_sel, k_range=[2, 3, 4], criterion="bic",
+                fix_nu=args.fix_nu, max_iter=min(args.max_iter, 100),
+                random_seed=args.seed,
+            )
+            logger.info(f"Selected K={n_states} (BIC={bic_val:.2f})")
+
         # Train model
-        model = train_hmm_model(feature_data, feature_columns, config)
-        
+        model = train_hmm_model(
+            features, feature_cols,
+            n_states=n_states,
+            fix_nu=args.fix_nu,
+            max_iter=args.max_iter,
+            tol=args.tol,
+            random_seed=args.seed,
+        )
+
         # Generate predictions
-        predictions = generate_predictions(model, feature_data, feature_columns)
-        
+        predictions = generate_predictions(model, features, feature_cols)
+
         # Save results
-        save_results(model, predictions, config, args.output_dir)
-        
+        save_results(model, predictions, feature_cols, args.output_dir)
+
         logger.info("HMM training pipeline completed successfully!")
-        
+
         # Print summary
-        print("\n" + "="*50)
+        print("\n" + "="*60)
         print("TRAINING SUMMARY")
-        print("="*50)
-        print(f"Model: {config['model']['name']}")
-        print(f"States: {config['model']['n_states']}")
-        print(f"Features: {len(feature_columns)}")
-        print(f"Observations: {len(feature_data)}")
-        print(f"Output directory: {args.output_dir}")
-        print("="*50)
-        
+        print("="*60)
+        p = model.params_
+        print(f"Model:          Student-t HMM")
+        print(f"States:         {model.n_states}")
+        print(f"Features:       {len(feature_cols)} (Tier {args.tier})")
+        print(f"  Columns:      {feature_cols}")
+        print(f"Observations:   {len(features)}")
+        print(f"Converged:      {p.converged} (iter {p.n_iter})")
+        print(f"Log-likelihood: {p.log_likelihood:.2f}")
+        print(f"BIC:            {p.bic:.2f}")
+        print(f"ν (d.f.):       {p.nu}")
+        print(f"Output:         {args.output_dir}/")
+        print("="*60)
+
     except Exception as e:
         logger.error(f"Training pipeline failed: {e}")
         raise

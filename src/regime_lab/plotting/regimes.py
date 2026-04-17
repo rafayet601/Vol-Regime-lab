@@ -159,12 +159,7 @@ class RegimePlotter:
         n_rows = (n_features + n_cols - 1) // n_cols
         
         fig, axes = plt.subplots(n_rows, n_cols, figsize=(5*n_cols, 4*n_rows))
-        if n_features == 1:
-            axes = [axes]
-        elif n_rows == 1:
-            axes = [axes]
-        else:
-            axes = axes.flatten()
+        axes = np.atleast_1d(axes).flatten()
         
         # Combine data for analysis
         combined_data = feature_data.copy()

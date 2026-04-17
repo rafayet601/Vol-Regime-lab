@@ -1,16 +1,26 @@
 {
   "model": "Student-t HMM",
   "n_states": 2,
-  "n_observations": 754,
-  "n_features": 2,
+  "n_observations": 935,
+  "n_features": 8,
+  "feature_cols": [
+    "rv_short",
+    "rv_medium",
+    "rv_long",
+    "vol_ratio",
+    "vrp",
+    "spot_ratio",
+    "term_ratio",
+    "downside_vol"
+  ],
   "date_range": {
-    "start": "2020-12-31",
+    "start": "2020-03-30",
     "end": "2023-12-29"
   },
   "regime_distribution": {
-    "state_0_pct": 35.94164456233422,
-    "state_1_pct": 64.05835543766578
+    "state_0_pct": 58.6096256684492,
+    "state_1_pct": 41.3903743315508
   },
-  "transitions": 183,
-  "avg_duration_days": 4.0978260869565215
+  "transitions": 18,
+  "avg_duration_days": 49.21052631578947
 }

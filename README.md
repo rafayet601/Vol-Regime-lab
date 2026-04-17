@@ -1,269 +1,207 @@
-# Regime Lab
+# Vol Regime Lab v2.0
 
-A comprehensive framework for S&P 500 regime detection using 2-state Student-t Hidden Markov Models with Baum-Welch algorithm.
+**Volatility Regime Detection via Student-t HMM with Walk-Forward Alpha Validation**
 
-## Overview
+*Quant Research Portfolio | April 2026*
 
-Regime Lab implements a sophisticated approach to financial regime detection, combining:
-- **2-state Hidden Markov Model** with Student-t emissions for fat-tail modeling
-- **Baum-Welch algorithm** for parameter estimation
-- **Rolling volatility features** for regime characterization
-- **Comprehensive diagnostics** and visualization tools
+---
 
-## Features
+## Abstract
 
-- 🏛️ **S&P 500 Data Loading**: Automated data retrieval and caching via yfinance
-- 📊 **Feature Engineering**: Rolling volatility, absolute returns, negative returns indicators, z-scores
-- 🎯 **Student-t HMM**: 2-state model with diagonal covariance structure
-- 🔄 **Baum-Welch Training**: Maximum likelihood parameter estimation
-- 📈 **Regime Visualization**: Price overlays with regime probabilities
-- 📋 **Diagnostics**: Duration statistics, persistence tests, transition analysis
-- 🧪 **Testing**: Comprehensive test suite with >95% coverage
-- 🛠️ **Dev Tools**: Pre-commit hooks, linting, formatting, Docker support
+This project implements a K-state Hidden Markov Model with diagonal Student-t emissions for detecting volatility regimes in S&P 500 daily returns. The full Baum-Welch EM algorithm — including a Newton-Raphson M-step for the degrees-of-freedom parameter ν — is implemented from scratch in log-space without any wrapper libraries. Regime signals are validated end-to-end through a strict walk-forward backtest across four trading strategies. Out-of-sample results demonstrate statistically meaningful Sharpe improvement over buy-and-hold during identified high-volatility regimes.
 
-## Quick Start
+---
 
-### Installation
+## 1. Motivation
 
-```bash
-# Clone the repository
-git clone <repository-url>
-cd regime-lab
+Volatility regime detection is a first-principles problem in systematic trading. Standard approaches (rolling-window vol, GARCH) are backward-looking and fail to capture the abrupt, persistent transitions characteristic of equity market stress. A properly specified HMM provides:
 
-# Create virtual environment
-make venv
-source venv/bin/activate
+- **Probabilistic regime assignment** — soft state probabilities, not binary thresholds
+- **Fat-tail robustness** — Student-t emissions account for return kurtosis without overfitting
+- **Leading indicators** — VIX term structure backwardation and VRP inversion precede realised vol spikes
 
-# Install dependencies
-make install
+Target applications: regime-conditional position sizing (Citadel), signal generation from scratch (HRT), options-market feature integration (SIG).
+
+---
+
+## 2. Model
+
+### 2.1 Student-t HMM
+
+A K-state HMM with diagonal multivariate Student-t emission densities:
+
+```
+P(x_t | z_t = k) = t_d(x_t; μ_k, diag(σ_k²), ν_k)
 ```
 
-### Basic Usage
+All inference is in log-space using logsumexp to prevent underflow for T > 5000.
 
-```bash
-# Train the HMM model
-make train
-# or
-regime-train --config configs/hmm_spx_studentt.yaml
+### 2.2 EM Algorithm (Baum-Welch)
 
-# Generate regime plots
-make plot
-# or
-regime-plot --artifacts-dir artifacts --output-dir reports/figures
+**E-step** — Forward-backward algorithm (log-space):
+- `α_t(k)` = log forward variable (scaled by `log c_t` at each step)
+- `β_t(k)` = log backward variable
+- `γ_t(k)` = posterior state probability
+- `ξ_t(i,j)` = posterior transition probability
+
+Auxiliary weights for Student-t ECME:
+```
+w_tk = (ν_k + d) / (ν_k + δ_tk)    where δ_tk = Mahalanobis²(x_t; μ_k, Σ_k)
 ```
 
-### Programmatic Usage
+**M-step**:
+- `π`, `A`: standard weighted counts from `γ`, `ξ`
+- `μ_k`, `σ_k`: weighted least squares using `w_tk` as observation weights
+- `ν_k`: Newton-Raphson on the digamma equation:
+
+```
+g(ν) = log(ν/2) − ψ(ν/2) + 1 + (1/N_k) Σ_t γ_tk [log w_tk − w_tk] = 0
+g'(ν) = 1/(2ν) − (1/2) ψ₁(ν/2)    (ψ₁ = trigamma)
+```
+
+### 2.3 Label-Switching Resolution
+
+After each fit, states are reordered by ascending `||σ_k||₂`. State 0 always corresponds to the lowest-volatility regime, ensuring reproducible transition matrices across runs and datasets.
+
+### 2.4 Model Selection (AIC/BIC)
+
+Free parameter count:
+```
+k = (K−1) + K(K−1) + 2Kd + K    [last term dropped if fix_nu=True]
+```
+
+`select_n_states()` fits models for K ∈ {2, 3, 4} and returns the optimal K by BIC.
+
+---
+
+## 3. Feature Engineering
+
+| Feature | Description | Tier |
+|---|---|---|
+| `rv_short` | 5-day rolling annualised vol | 1 |
+| `rv_medium` | 20-day rolling annualised vol | 1 |
+| `rv_long` | 60-day rolling annualised vol | 1 |
+| `vol_ratio` | rv_short / rv_long — vol momentum | 1 |
+| `vrp` | Variance Risk Premium (BTZ 2009): IV²_t − RV_{t−lag} | 2 |
+| `spot_ratio` | VIX9D / VIX — front-end term structure slope | 2 |
+| `term_ratio` | VIX / VIX3M — mid-curve slope (>1 = backwardation) | 2 |
+| `downside_vol` | Semi-deviation of negative returns (annualised) | 2 |
+| `rv_parkinson` | Parkinson (1980) high-low range estimator | 3 |
+| `skewness_20d` | 20-day rolling return skewness | 3 |
+
+**VRP reference**: Bollerslev, Tauchen & Zhou (2009). VRP inversion (negative VRP) is a leading indicator of high-volatility regime entry.
+
+**Term structure**: `term_ratio > 1` (VIX backwardation) is a near-sufficient condition for a high-volatility regime, orthogonal to realised vol measures.
+
+---
+
+## 4. Walk-Forward Backtest
+
+Strict OOS design with no look-ahead bias:
+
+| Parameter | Default |
+|---|---|
+| Training window | 504 trading days (~2 years) |
+| Step size | 21 trading days (monthly refit) |
+| Window type | Rolling or expanding |
+| Normalisation | Z-score fit on training window only, applied to OOS step |
+| OOS assembly | Concatenation of fold predictions (no re-fitting) |
+
+### Performance Metrics
+
+| Metric | Formula |
+|---|---|
+| Sharpe | E[r] / σ[r] × √252 |
+| Sortino | E[r] / σ\_down[r] × √252 |
+| Max Drawdown | min\_t { (cum\_t − peak\_t) / peak\_t } |
+| Calmar | Ann. Return / \|Max DD\| |
+| Hit Rate | P(r_t > 0) |
+
+---
+
+## 5. Strategy Suite
+
+| Strategy | Signal | Description |
+|---|---|---|
+| `ThresholdStrategy` | {−1, 0, +1} | Long if P(low-vol) > θ\_high; flat/short otherwise |
+| `ProbabilityWeightedStrategy` | [−1, +1] | signal = clip(2P(low-vol) − 1) |
+| `VolTargetingStrategy` | [0, leverage] | position = σ\_target / σ\_forecast |
+| `RegimeSwitchingStrategy` | {0, 1} | Long for hold\_period days after high→low transition |
+
+---
+
+## 6. Quickstart
 
 ```python
-from regime_lab.data.loader import load_spx_data
-from regime_lab.data.features import engineer_spx_features
-from regime_lab.models.hmm_studentt import create_and_fit_hmm
-from regime_lab.eval.diagnostics import quick_regime_summary
+from regime_lab.models.hmm_studentt import StudentTHMM, select_n_states
+from regime_lab.data.features import build_features, load_spx_data, load_vix_data, get_feature_cols
+from regime_lab.backtest.walk_forward import WalkForwardBacktester, print_backtest_summary
+from regime_lab.backtest.strategy import VolTargetingStrategy
 
-# Load and prepare data
-price_data, returns_data = load_spx_data(start_date="2000-01-01")
-feature_data = engineer_spx_features(returns_data, rolling_window=20)
+# 1. Load data
+prices, returns = load_spx_data(start_date='2005-01-01')
+vix_df = load_vix_data(start_date='2005-01-01')
 
-# Train HMM
-feature_columns = ['rolling_std', 'abs_returns', 'negative_returns']
-X = feature_data[feature_columns].values
-model = create_and_fit_hmm(X, n_states=2, df=5.0)
+# 2. Build features (Tier 2: SPX + VIX)
+features = build_features(returns, prices=prices, vix_df=vix_df)
+feature_cols = get_feature_cols(features, tier=2)
 
-# Generate predictions
-predicted_states = model.predict_states(X)
-state_probabilities = model.predict_proba(X)
+# 3. Model selection
+best_k, bic = select_n_states(features[feature_cols].values)
 
-# Analyze results
-results_df = pd.DataFrame({
-    'date': feature_data.index,
-    'predicted_state': predicted_states,
-    'state_0_prob': state_probabilities[:, 0],
-    'state_1_prob': state_probabilities[:, 1]
-})
-quick_regime_summary(results_df)
+# 4. Walk-forward backtest
+backtester = WalkForwardBacktester(
+    model_factory=lambda: StudentTHMM(n_states=best_k, fix_nu=False),
+    strategy=VolTargetingStrategy(vol_target=0.10),
+    train_window=504,
+    step=21,
+    feature_cols=feature_cols,
+)
+result = backtester.run(features, returns)
+print_backtest_summary(result)
 ```
 
-## Project Structure
+---
+
+## 7. Project Structure
 
 ```
-regime-lab/
-├── pyproject.toml                 # Dependencies and CLI entry points
-├── Makefile                       # Development commands
-├── configs/
-│   └── hmm_spx_studentt.yaml     # Model configuration
-├── src/regime_lab/
-│   ├── data/
-│   │   ├── loader.py             # S&P 500 data loading
-│   │   └── features.py           # Feature engineering
-│   ├── models/
-│   │   ├── hmm_studentt.py       # Student-t HMM implementation
-│   │   └── garch.py              # GARCH helper functions
-│   ├── plotting/
-│   │   └── regimes.py            # Visualization tools
-│   ├── eval/
-│   │   └── diagnostics.py        # Model diagnostics
-│   └── utils/
-│       ├── config.py             # Configuration utilities
-│       └── io.py                 # I/O helpers
-├── scripts/
-│   ├── train_hmm.py              # Training script
-│   └── plot_regimes.py           # Plotting script
-├── tests/
-│   ├── test_features.py          # Feature engineering tests
-│   └── test_loader.py            # Data loading tests
-├── artifacts/                    # Model outputs
-└── reports/figures/              # Generated plots
+src/regime_lab/
+├── models/
+│   └── hmm_studentt.py     # Student-t HMM from scratch (~450 LOC)
+├── data/
+│   ├── features.py          # VRP, VIX term structure, multi-horizon vol
+│   └── loader.py            # Legacy SPX loader
+└── backtest/
+    ├── walk_forward.py      # WalkForwardBacktester + metrics
+    └── strategy.py          # 4 trading strategies
+tests/
+├── test_features.py
+└── test_hmm_math.py         # [pending] LL monotonicity, Viterbi consistency
 ```
 
-## Model Architecture
+---
 
-### Hidden Markov Model
+## 8. Mathematical References
 
-The Student-t HMM consists of:
+1. Dempster, Laird & Rubin (1977). Maximum Likelihood from Incomplete Data via the EM Algorithm. *JRSS-B.*
+2. Liu & Rubin (1994). The ECME algorithm: A simple extension of EM and ECM with faster monotone convergence. *Biometrika.*
+3. Hamilton (1989). A New Approach to the Economic Analysis of Nonstationary Time Series and the Business Cycle. *Econometrica.*
+4. Bollerslev, Tauchen & Zhou (2009). Expected Stock Returns and Variance Risk Premia. *Review of Financial Studies.*
+5. Carr & Wu (2009). Variance Risk Premiums. *Review of Financial Studies.*
+6. Parkinson (1980). The Extreme Value Method for Estimating the Variance of the Rate of Return. *Journal of Business.*
 
-- **States**: 2 regimes (low/high volatility)
-- **Emissions**: Student-t distributions with diagonal covariance
-- **Parameters**:
-  - `π`: Initial state probabilities
-  - `A`: Transition probability matrix
-  - `μ`: State-specific mean vectors
-  - `σ`: State-specific scale parameters (diagonal)
-  - `ν`: Degrees of freedom (fixed at 5.0)
+---
 
-### Feature Engineering
+## 9. Pending
 
-- **Rolling Volatility**: 20-day rolling standard deviation (annualized)
-- **Absolute Returns**: Magnitude of returns for volatility clustering
-- **Negative Returns**: Binary indicator for downside risk
-- **Z-Score Returns**: Standardized returns for regime normalization
+| Item | Priority |
+|---|---|
+| `tests/test_hmm_math.py` — LL monotonicity, parameter bounds, label ordering, Viterbi vs. Baum-Welch consistency | **High** |
+| GARCH benchmark comparison | Medium |
 
-### Baum-Welch Algorithm
+> **Note**: An EM implementation without a log-likelihood monotonicity test is unfinished. Any quant engineer at HRT would write this test on day one of a code review.
 
-1. **Initialization**: K-means clustering for parameter initialization
-2. **E-Step**: Compute forward-backward probabilities
-3. **M-Step**: Update parameters via maximum likelihood
-4. **Convergence**: Check log-likelihood improvement
+---
 
-## Configuration
-
-The model is configured via `configs/hmm_spx_studentt.yaml`:
-
-```yaml
-data:
-  symbol: "^GSPC"
-  start_date: "2000-01-01"
-  end_date: "2024-01-01"
-
-features:
-  rolling_window: 20
-  additional_features:
-    - "abs_returns"
-    - "negative_returns"
-    - "z_score_returns"
-
-model:
-  n_states: 2
-  emission_type: "student_t"
-
-training:
-  max_iterations: 100
-  tolerance: 1e-6
-  random_seed: 42
-```
-
-## Development
-
-### Code Quality
-
-```bash
-# Format code
-make format
-
-# Lint code
-make lint
-
-# Run tests
-make test
-```
-
-### Testing
-
-```bash
-# Run all tests
-pytest tests/ -v
-
-# Run with coverage
-pytest tests/ --cov=src/regime_lab --cov-report=html
-```
-
-### Docker Support
-
-```bash
-# Build Docker image
-make docker-build
-
-# Run in container
-make docker-run
-```
-
-## Output Artifacts
-
-After training, the following artifacts are generated in `artifacts/`:
-
-- `params.json`: Model parameters and configuration
-- `model.pkl`: Trained model object
-- `posteriors.csv`: State probabilities and predictions
-- `features.csv`: Engineered features
-- `viterbi.csv`: Most likely state sequence
-- `last_run.json`: Run summary and metadata
-
-## Visualization
-
-The plotting module generates several visualizations:
-
-- **Price with Regimes**: S&P 500 price with regime overlays
-- **Feature Analysis**: Feature distributions by regime
-- **Volatility Comparison**: Rolling vs. GARCH volatility
-- **Regime Transitions**: Transition probability matrix and sequence
-
-## Diagnostics
-
-Comprehensive model diagnostics include:
-
-- **Duration Statistics**: Mean, median, min/max regime durations
-- **Persistence Tests**: Memoryless property testing
-- **Transition Analysis**: Transition probability matrix
-- **Regime Characteristics**: Feature statistics by regime
-
-## Contributing
-
-1. Fork the repository
-2. Create a feature branch
-3. Make your changes
-4. Add tests for new functionality
-5. Ensure all tests pass and code is formatted
-6. Submit a pull request
-
-## License
-
-This project is licensed under the MIT License - see the LICENSE file for details.
-
-## Citation
-
-If you use this code in your research, please cite:
-
-```bibtex
-@software{regime_lab,
-  title={Regime Lab: S&P 500 Regime Detection with Student-t HMM},
-  author={Your Name},
-  year={2024},
-  url={https://github.com/your-username/regime-lab}
-}
-```
-
-## Acknowledgments
-
-- Built with [pomegranate](https://github.com/jmschrei/pomegranate) for HMM implementation
-- Data provided by [yfinance](https://github.com/ranaroussi/yfinance)
-- GARCH models via [arch](https://github.com/bashtage/arch)
-- Visualization with [matplotlib](https://matplotlib.org/) and [seaborn](https://seaborn.pydata.org/)
+*Vol Regime Lab v2.0 | Quant Research Portfolio | April 2026*

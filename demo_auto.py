@@ -1,13 +1,14 @@
 #!/usr/bin/env python3
 """
-Regime Lab Automated Demo Script
-=================================
+Regime Lab Automated Demo Script (v2.0 API)
+=============================================
 Full automated demonstration without interactive prompts.
+Uses the v2.0 functional feature API.
 """
 
 import sys
-import warnings
 import time
+import warnings
 from pathlib import Path
 
 import numpy as np
@@ -33,116 +34,123 @@ def print_subsection(title):
     print(f"\n{title}")
     print("-" * 70)
 
-print_section("🎯 REGIME LAB - COMPREHENSIVE CAPABILITIES DEMO")
+print_section("🎯 REGIME LAB - COMPREHENSIVE CAPABILITIES DEMO (v2.0)")
 
 # =============================================================================
-# DEMO 1: Data Loading and Feature Engineering
+# PART 1: Data Loading and Feature Engineering
 # =============================================================================
 print_subsection("📊 PART 1: Data Loading and Feature Engineering")
 
-from regime_lab.data.loader import SPXDataLoader
-from regime_lab.data.features import FeatureEngineer
-
-loader = SPXDataLoader(cache_dir="./data/raw")
-print("✓ Data loader initialized")
-
-print("\n📥 Loading S&P 500 data (2020-2024)...")
-try:
-    price_data, returns_data = loader.get_full_dataset(
-        symbol="^GSPC",
-        start_date="2020-01-01",
-        end_date="2024-01-01"
-    )
-    print(f"✓ Loaded {len(price_data)} price observations")
-    print(f"✓ Computed {len(returns_data)} return observations")
-    print(f"\nPrice data shape: {price_data.shape}")
-    print(f"Price range: ${price_data['close'].min():.2f} - ${price_data['close'].max():.2f}")
-    print(f"Date range: {price_data.index[0].date()} to {price_data.index[-1].date()}")
-except Exception as e:
-    print(f"⚠️  Creating synthetic data for demo: {e}")
-    dates = pd.date_range('2020-01-01', '2024-01-01', freq='D')
-    returns = np.random.normal(0.0005, 0.012, len(dates))
-    returns_data = pd.DataFrame({'returns': returns}, index=dates)
-    price_data = returns_data.copy()
-    price_data['close'] = 3000 * np.cumprod(1 + returns)
-    print(f"✓ Created {len(returns_data)} synthetic observations")
-
-print("\n🔧 Engineering features...")
-feature_engineer = FeatureEngineer(returns_column="returns")
-feature_data = feature_engineer.engineer_features(
-    returns_data,
-    rolling_window=20,
-    additional_features=["abs_returns", "negative_returns", "z_score_returns"],
-    volatility_method="std",
-    annualize_vol=True
+from regime_lab.data.features import (
+    build_features, get_feature_cols, load_spx_data, load_vix_data
 )
 
-print(f"✓ Engineered {len(feature_data.columns)} features")
-print(f"✓ Valid observations: {len(feature_data)} (after removing NaN)")
+print("📥 Loading S&P 500 data (2020-2024)...")
+try:
+    prices, returns = load_spx_data(
+        start_date="2020-01-01",
+        end_date="2024-01-01",
+    )
+    print(f"✓ Loaded {len(prices)} price observations")
+    print(f"✓ Computed {len(returns)} return observations")
+    print(f"\nPrice data shape: {prices.shape}")
+    print(f"Price range: ${prices['close'].min():.2f} - ${prices['close'].max():.2f}")
+    print(f"Date range: {prices.index[0].date()} to {prices.index[-1].date()}")
+except Exception as e:
+    print(f"⚠️  Creating synthetic data for demo: {e}")
+    dates = pd.date_range('2020-01-01', '2024-01-01', freq='B')
+    ret_vals = np.random.normal(0.0005, 0.012, len(dates))
+    returns = pd.Series(ret_vals, index=dates, name="returns")
+    prices = pd.DataFrame({
+        'open': 3000 * np.cumprod(1 + ret_vals),
+        'high': 3000 * np.cumprod(1 + ret_vals) * 1.005,
+        'low':  3000 * np.cumprod(1 + ret_vals) * 0.995,
+        'close': 3000 * np.cumprod(1 + ret_vals),
+    }, index=dates)
+    print(f"✓ Created {len(returns)} synthetic observations")
+
+# Load VIX data for Tier 2 features
+print("\n📥 Loading VIX data...")
+try:
+    vix_df = load_vix_data(start_date="2020-01-01", end_date="2024-01-01")
+    print(f"✓ Loaded VIX data: {len(vix_df)} days")
+except Exception as e:
+    print(f"⚠️  VIX data unavailable, using Tier 1 features only: {e}")
+    vix_df = None
+
+# Build features with v2.0 API
+print("\n🔧 Building feature matrix...")
+features = build_features(returns, prices=prices, vix_df=vix_df)
+feature_cols = get_feature_cols(features, tier=2 if vix_df is not None else 1)
+
+print(f"✓ Built {len(features.columns)} total columns")
+print(f"✓ Selected {len(feature_cols)} features: {feature_cols}")
+print(f"✓ Valid observations: {len(features)} (after removing NaN)")
 
 print("\n📈 Feature Statistics:")
-feature_stats = feature_data[['returns', 'rolling_std', 'abs_returns']].describe()
+feature_stats = features[feature_cols].describe()
 print(feature_stats.to_string())
 
 # =============================================================================
-# DEMO 2: HMM Model Training
+# PART 2: HMM Model Training
 # =============================================================================
 print_subsection("🤖 PART 2: Student-t HMM Training with Baum-Welch")
 
 from regime_lab.models.hmm_studentt import StudentTHMM
 
-feature_columns = ['rolling_std', 'abs_returns']
-X = feature_data[feature_columns].values
+X = features[feature_cols].values
 
 print(f"📊 Training data: {X.shape[0]} observations × {X.shape[1]} features")
-print(f"   Features: {feature_columns}")
+print(f"   Features: {feature_cols}")
 
 print("\n🔄 Initializing and training 2-state Student-t HMM...")
-print("   (Using 30 iterations for demo speed)")
+print("   (Using max_iter=50 for demo speed)")
 
 model = StudentTHMM(
     n_states=2,
-    n_features=len(feature_columns),
-    df=5.0,
-    random_seed=42
+    fix_nu=False,
+    max_iter=50,
+    tol=1e-6,
+    random_seed=42,
 )
 
+fitted = False
 try:
     start_time = time.time()
-    model.fit(X, max_iterations=30, tolerance=1e-6, verbose=False)
+    model.fit(X)
     train_time = time.time() - start_time
-    
+
     print(f"✓ Training completed in {train_time:.2f} seconds")
-    
+
     model_summary = model.get_model_summary()
-    
+
     print("\n📊 Learned Model Parameters:")
-    trans_matrix = np.array(model_summary['transition_matrix'])
+    A = np.array(model_summary['A'])
     print("\n🔀 Transition Matrix:")
     print(f"          To State 0  To State 1")
-    print(f"From 0:      {trans_matrix[0,0]:.4f}      {trans_matrix[0,1]:.4f}")
-    print(f"From 1:      {trans_matrix[1,0]:.4f}      {trans_matrix[1,1]:.4f}")
-    
+    print(f"From 0:      {A[0,0]:.4f}      {A[0,1]:.4f}")
+    print(f"From 1:      {A[1,0]:.4f}      {A[1,1]:.4f}")
+
     print("\n🎨 Emission Parameters:")
-    means = np.array(model_summary['means'])
-    scales = np.array(model_summary['scales'])
-    
+    mu = np.array(model_summary['mu'])
+    sigma = np.array(model_summary['sigma'])
+    nu = np.array(model_summary['nu'])
+
     for i in range(2):
-        vol_diff = "Lower" if means[i,0] < means[1-i,0] else "Higher"
-        regime_type = "Low Vol" if means[i,0] < means[1-i,0] else "High Vol"
+        vol_norm_0 = np.linalg.norm(sigma[0])
+        vol_norm_1 = np.linalg.norm(sigma[1])
+        regime_type = "Low Vol" if i == 0 else "High Vol"
         print(f"\n   State {i} ({regime_type} Regime):")
-        print(f"     Rolling Std Mean:  {means[i,0]:.6f} ({vol_diff} volatility)")
-        print(f"     Rolling Std Scale: {scales[i,0]:.6f}")
-        print(f"     Abs Returns Mean:  {means[i,1]:.6f}")
-        print(f"     Abs Returns Scale: {scales[i,1]:.6f}")
-        
+        for j, col in enumerate(feature_cols):
+            print(f"     {col}: μ={mu[i,j]:.6f}, σ={sigma[i,j]:.6f}")
+        print(f"     ν = {nu[i]:.2f}")
+
     fitted = True
 except Exception as e:
     print(f"⚠️  Using simulated model: {e}")
-    fitted = False
 
 # =============================================================================
-# DEMO 3: Predictions and Analysis
+# PART 3: Predictions and Analysis
 # =============================================================================
 print_subsection("🔮 PART 3: State Prediction and Regime Analysis")
 
@@ -150,10 +158,10 @@ print("🎯 Generating predictions using Viterbi algorithm...")
 
 if fitted:
     try:
-        predicted_states = model.predict_states(X)
+        predicted_states = model.predict(X)
         state_probabilities = model.predict_proba(X)
         print(f"✓ Generated {len(predicted_states)} state predictions")
-    except:
+    except Exception:
         predicted_states = (np.random.rand(len(X)) > 0.7).astype(int)
         state_probabilities = np.column_stack([
             1 - predicted_states,
@@ -167,12 +175,11 @@ else:
     ])
 
 results_df = pd.DataFrame({
-    'date': feature_data.index,
+    'date': features.index,
     'predicted_state': predicted_states,
     'state_0_prob': state_probabilities[:, 0],
     'state_1_prob': state_probabilities[:, 1],
-    'returns': feature_data['returns'].values,
-    'rolling_std': feature_data['rolling_std'].values
+    'returns': features['returns'].values,
 })
 
 print("\n📊 Regime Distribution:")
@@ -195,20 +202,19 @@ print("\n💰 Returns by Regime:")
 for state in [0, 1]:
     regime_data = results_df[results_df['predicted_state'] == state]
     regime_returns = regime_data['returns']
-    regime_vol = regime_data['rolling_std']
     regime_name = "Low Volatility" if state == 0 else "High Volatility"
-    
-    print(f"\n   State {state} ({regime_name}):")
-    print(f"     Observations: {len(regime_data)}")
-    print(f"     Mean daily return: {regime_returns.mean()*100:7.4f}%")
-    print(f"     Std dev (daily):   {regime_returns.std()*100:7.4f}%")
-    print(f"     Mean volatility:   {regime_vol.mean()*100:7.2f}%")
-    print(f"     Sharpe ratio:      {(regime_returns.mean() / regime_returns.std() * np.sqrt(252)):7.3f}")
-    print(f"     Best day:          {regime_returns.max()*100:7.4f}%")
-    print(f"     Worst day:         {regime_returns.min()*100:7.4f}%")
+
+    if len(regime_data) > 0 and regime_returns.std() > 0:
+        print(f"\n   State {state} ({regime_name}):")
+        print(f"     Observations: {len(regime_data)}")
+        print(f"     Mean daily return: {regime_returns.mean()*100:7.4f}%")
+        print(f"     Std dev (daily):   {regime_returns.std()*100:7.4f}%")
+        print(f"     Sharpe ratio:      {(regime_returns.mean() / regime_returns.std() * np.sqrt(252)):7.3f}")
+        print(f"     Best day:          {regime_returns.max()*100:7.4f}%")
+        print(f"     Worst day:         {regime_returns.min()*100:7.4f}%")
 
 # =============================================================================
-# DEMO 4: Comprehensive Diagnostics
+# PART 4: Comprehensive Diagnostics
 # =============================================================================
 print_subsection("📋 PART 4: Comprehensive Diagnostics")
 
@@ -225,7 +231,6 @@ try:
     diagnostics.print_diagnostic_summary(diagnostic_report)
 except Exception as e:
     print(f"⚠️  Using simplified diagnostics: {e}")
-    # Simplified diagnostics
     diagnostic_report = {
         "summary": {
             "total_observations": len(results_df),
@@ -246,20 +251,13 @@ if 'regime_characteristics' in diagnostic_report:
         chars = regime_chars[regime_key]
         regime_num = int(regime_key.split('_')[1])
         regime_name = "Low Volatility" if regime_num == 0 else "High Volatility"
-        
+
         print(f"\n   {regime_name} Regime (State {regime_num}):")
         print(f"     Duration: {chars['frequency']} days ({chars['percentage']:.1f}%)")
         print(f"     Avg duration per episode: {chars['mean_duration']:.1f} days")
-        
-        if 'feature_statistics' in chars and chars['feature_statistics']:
-            print(f"     Feature averages:")
-            for feature in ['rolling_std', 'abs_returns', 'returns']:
-                if feature in chars['feature_statistics']:
-                    stats = chars['feature_statistics'][feature]
-                    print(f"       {feature:15s}: {stats['mean']:8.6f} ± {stats['std']:8.6f}")
 
 # =============================================================================
-# DEMO 5: Visualization
+# PART 5: Visualization
 # =============================================================================
 print_subsection("📈 PART 5: Generating Visualizations")
 
@@ -274,7 +272,7 @@ print("🎨 Creating plots...")
 try:
     import matplotlib
     matplotlib.use('Agg')
-    
+
     print("\n1️⃣  Regime transitions plot...", end=" ")
     plotter.plot_regime_transitions(
         results_df,
@@ -282,19 +280,19 @@ try:
         save_path="./demo_output/regime_transitions.png"
     )
     print("✓")
-    
+
     print("2️⃣  Feature analysis plot...", end=" ")
     plotter.plot_feature_analysis(
-        feature_data,
+        features,
         results_df,
-        feature_columns=['rolling_std', 'abs_returns', 'z_score_returns'],
+        feature_columns=feature_cols[:3],
         title="Feature Distributions by Regime",
         save_path="./demo_output/feature_analysis.png"
     )
     print("✓")
-    
+
     print("3️⃣  Volatility comparison plot...", end=" ")
-    combined_data = feature_data.copy()
+    combined_data = features.copy()
     combined_data['predicted_state'] = results_df['predicted_state'].values
     plotter.plot_volatility_comparison(
         combined_data,
@@ -302,14 +300,14 @@ try:
         save_path="./demo_output/volatility_comparison.png"
     )
     print("✓")
-    
+
     print("\n✅ All visualizations saved to: demo_output/")
-    
+
 except Exception as e:
     print(f"\n⚠️  Visualization note: {e}")
 
 # =============================================================================
-# DEMO 6: Saving Results
+# PART 6: Saving Results
 # =============================================================================
 print_subsection("💾 PART 6: Saving Model and Results")
 
@@ -319,28 +317,25 @@ from regime_lab.utils.config import save_json
 print("💾 Saving artifacts...")
 
 try:
-    if fitted:
-        model.save_model("./demo_output/trained_model.pkl")
-        print("✓ Model:       demo_output/trained_model.pkl")
-    
     save_dataframe(results_df, "./demo_output/predictions.csv")
     print("✓ Predictions: demo_output/predictions.csv")
-    
+
     save_json(diagnostic_report, "./demo_output/diagnostics.json")
     print("✓ Diagnostics: demo_output/diagnostics.json")
-    
-    save_dataframe(feature_data, "./demo_output/features.csv")
+
+    save_dataframe(features, "./demo_output/features.csv")
     print("✓ Features:    demo_output/features.csv")
-    
+
     # Create summary report
     summary = {
         "model": "Student-t HMM",
         "n_states": 2,
         "n_observations": len(results_df),
-        "n_features": len(feature_columns),
+        "n_features": len(feature_cols),
+        "feature_cols": feature_cols,
         "date_range": {
-            "start": str(feature_data.index[0].date()),
-            "end": str(feature_data.index[-1].date())
+            "start": str(features.index[0].date()),
+            "end": str(features.index[-1].date())
         },
         "regime_distribution": {
             "state_0_pct": float((results_df['predicted_state'] == 0).mean() * 100),
@@ -349,12 +344,12 @@ try:
         "transitions": int(transitions),
         "avg_duration_days": float(avg_duration)
     }
-    
+
     save_json(summary, "./demo_output/summary.json")
     print("✓ Summary:     demo_output/summary.json")
-    
+
     print("\n✅ All artifacts saved successfully!")
-    
+
 except Exception as e:
     print(f"⚠️  Save note: {e}")
 
@@ -364,53 +359,47 @@ except Exception as e:
 print_section("🎉 DEMO COMPLETE - Capabilities Summary")
 
 print("""
-✅ DEMONSTRATED CAPABILITIES:
+✅ DEMONSTRATED CAPABILITIES (v2.0):
 
 1️⃣  📊 DATA PIPELINE
-    ✓ Real-time S&P 500 data loading via yfinance
-    ✓ Intelligent caching system
-    ✓ Log/simple returns computation
-    ✓ Data validation and error handling
+    ✓ S&P 500 daily OHLCV via yfinance
+    ✓ VIX / VIX9D / VIX3M term structure data
+    ✓ Log returns computation
 
-2️⃣  🔧 FEATURE ENGINEERING  
-    ✓ Rolling volatility (20-day, annualized)
-    ✓ Absolute returns for volatility clustering
-    ✓ Negative returns indicator
-    ✓ Z-score normalization
-    ✓ Feature validation
+2️⃣  🔧 FEATURE ENGINEERING (v2.0 Functional API)
+    ✓ Multi-horizon rolling vol (5-/20-/60-day)
+    ✓ Variance Risk Premium (BTZ 2009)
+    ✓ VIX term structure: spot_ratio, term_ratio
+    ✓ Downside vol & Parkinson estimator
+    ✓ Tiered feature selection (Tier 1/2/3)
 
 3️⃣  🤖 STUDENT-T HMM MODEL
-    ✓ 2-state Hidden Markov Model
-    ✓ Student-t emissions for fat tails (df=5.0)
-    ✓ Baum-Welch maximum likelihood estimation
-    ✓ K-means initialization
-    ✓ Diagonal covariance structure
+    ✓ K-state HMM with diagonal Student-t emissions
+    ✓ Baum-Welch EM with log-space forward-backward
+    ✓ Newton-Raphson M-step for degrees-of-freedom ν
+    ✓ Canonical label-switching resolution (ascending σ)
+    ✓ AIC/BIC model selection
 
 4️⃣  🔮 PREDICTIONS & INFERENCE
-    ✓ Viterbi algorithm for state sequence
-    ✓ Forward-backward for state probabilities
+    ✓ Log-space Viterbi for MAP state sequence
+    ✓ Forward-backward for posterior state probabilities
     ✓ Regime classification
-    ✓ Transition probability estimation
 
 5️⃣  📋 COMPREHENSIVE DIAGNOSTICS
     ✓ Regime duration statistics
     ✓ Persistence testing
     ✓ Transition analysis
     ✓ Feature characteristics by regime
-    ✓ Performance metrics by regime
 
 6️⃣  📈 RICH VISUALIZATIONS
     ✓ Regime transition plots
     ✓ Feature distribution analysis
     ✓ Volatility comparisons
     ✓ Transition matrices
-    ✓ Price overlays with regimes
 
 7️⃣  💾 FULL PERSISTENCE
-    ✓ Model serialization (pickle)
     ✓ Results export (CSV/JSON)
     ✓ Complete reproducibility
-    ✓ Configuration management
 """)
 
 print("="*70)
@@ -428,26 +417,19 @@ print("🚀 NEXT STEPS:")
 print("="*70)
 print("""
    1. Train on full historical data:
-      $ python scripts/train_hmm.py --config configs/hmm_spx_studentt.yaml
+      $ python scripts/train_hmm.py
 
-   2. Generate comprehensive visualizations:
-      $ python scripts/plot_regimes.py --output-dir reports/figures
+   2. Run walk-forward backtest:
+      from regime_lab.backtest.walk_forward import WalkForwardBacktester
+      from regime_lab.backtest.strategy import VolTargetingStrategy
 
    3. Run the test suite:
       $ pytest tests/ -v --cov=src/regime_lab
 
    4. View the generated plots:
       $ open demo_output/*.png
-
-   5. Explore the artifacts:
-      $ cat demo_output/summary.json
-      $ head demo_output/predictions.csv
-
-   6. Use in your own code:
-      from regime_lab.models.hmm_studentt import StudentTHMM
-      from regime_lab.data.loader import load_spx_data
 """)
 
 print("="*70)
-print("✨ Regime Lab - Professional S&P 500 Regime Detection")
+print("✨ Regime Lab v2.0 — Professional S&P 500 Regime Detection")
 print("="*70)

@@ -1,346 +1,350 @@
-"""Tests for feature engineering functionality."""
+"""
+Tests for v2.0 feature engineering (features.py).
+
+Covers all functional requirements:
+  FR-04: Variance Risk Premium
+  FR-05: VIX term structure features
+  FR-06: Multi-horizon volatility
+  FR-07: Downside risk & skewness
+  build_features / get_feature_cols tier system
+"""
+
+from __future__ import annotations
+
+import sys
+from pathlib import Path
 
 import numpy as np
 import pandas as pd
 import pytest
-from pandas import DataFrame
 
-import sys
-from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 
-from regime_lab.data.features import FeatureEngineer, engineer_spx_features
+from regime_lab.data.features import (
+    build_features,
+    get_feature_cols,
+    variance_risk_premium,
+    vix_term_structure_features,
+    realized_variance_cc,
+    realized_variance_parkinson,
+    multi_horizon_vol,
+    downside_skew_features,
+)
 
 
-class TestFeatureEngineer:
-    """Test cases for FeatureEngineer class."""
-    
-    @pytest.fixture
-    def sample_returns_data(self):
-        """Create sample returns data for testing."""
-        np.random.seed(42)
-        dates = pd.date_range('2020-01-01', periods=100, freq='D')
-        returns = np.random.normal(0, 0.02, 100)  # 2% daily volatility
-        
-        return pd.DataFrame({
-            'returns': returns
-        }, index=dates)
-    
-    @pytest.fixture
-    def feature_engineer(self):
-        """Create FeatureEngineer instance."""
-        return FeatureEngineer(returns_column="returns")
-    
-    def test_rolling_volatility_std(self, feature_engineer, sample_returns_data):
-        """Test rolling volatility calculation with standard deviation."""
-        result = feature_engineer.compute_rolling_volatility(
-            sample_returns_data, window=20, method="std"
-        )
-        
-        assert "rolling_std" in result.columns
-        assert len(result) == len(sample_returns_data)
-        assert not result["rolling_std"].isna().all()
-        
-        # First 19 values should be NaN (window size - 1)
-        assert result["rolling_std"].iloc[:19].isna().all()
-        assert not result["rolling_std"].iloc[19:].isna().all()
-    
-    def test_rolling_volatility_ewm(self, feature_engineer, sample_returns_data):
-        """Test rolling volatility calculation with exponential weighting."""
-        result = feature_engineer.compute_rolling_volatility(
-            sample_returns_data, window=20, method="ewm"
-        )
-        
-        assert "rolling_std" in result.columns
-        assert len(result) == len(sample_returns_data)
-        assert not result["rolling_std"].isna().all()
-    
-    def test_rolling_volatility_annualized(self, feature_engineer, sample_returns_data):
-        """Test annualized rolling volatility."""
-        result_annualized = feature_engineer.compute_rolling_volatility(
-            sample_returns_data, window=20, annualize=True
-        )
-        
-        result_daily = feature_engineer.compute_rolling_volatility(
-            sample_returns_data, window=20, annualize=False
-        )
-        
-        # Annualized should be larger (multiplied by sqrt(252))
-        annualized_factor = np.sqrt(252)
-        assert np.allclose(
-            result_annualized["rolling_std"].iloc[19:],
-            result_daily["rolling_std"].iloc[19:] * annualized_factor,
-            rtol=1e-10
-        )
-    
-    def test_rolling_volatility_invalid_method(self, feature_engineer, sample_returns_data):
-        """Test rolling volatility with invalid method."""
-        with pytest.raises(ValueError, match="Unsupported volatility method"):
-            feature_engineer.compute_rolling_volatility(
-                sample_returns_data, window=20, method="invalid"
-            )
-    
-    def test_rolling_volatility_missing_column(self, feature_engineer, sample_returns_data):
-        """Test rolling volatility with missing returns column."""
-        data_no_returns = sample_returns_data.drop(columns=["returns"])
-        
-        with pytest.raises(KeyError, match="Returns column 'returns' not found"):
-            feature_engineer.compute_rolling_volatility(data_no_returns, window=20)
-    
-    def test_add_absolute_returns(self, feature_engineer, sample_returns_data):
-        """Test absolute returns feature."""
-        result = feature_engineer.add_absolute_returns(sample_returns_data)
-        
-        assert "abs_returns" in result.columns
-        assert np.allclose(result["abs_returns"], np.abs(result["returns"]))
-    
-    def test_add_negative_returns(self, feature_engineer, sample_returns_data):
-        """Test negative returns indicator."""
-        result = feature_engineer.add_negative_returns(sample_returns_data)
-        
-        assert "negative_returns" in result.columns
-        assert result["negative_returns"].dtype == int
-        assert np.allclose(
-            result["negative_returns"], 
-            (result["returns"] < 0).astype(int)
-        )
-    
-    def test_add_z_score_returns_rolling(self, feature_engineer, sample_returns_data):
-        """Test z-score returns with rolling window."""
-        result = feature_engineer.add_z_score_returns(
-            sample_returns_data, window=20, method="rolling"
-        )
-        
-        assert "z_score_returns" in result.columns
-        assert len(result) == len(sample_returns_data)
-        
-        # Z-scores should have mean ~0 and std ~1 for the rolling window
-        valid_z_scores = result["z_score_returns"].dropna()
-        assert abs(valid_z_scores.mean()) < 0.1  # Close to zero
-        assert abs(valid_z_scores.std() - 1) < 0.1  # Close to one
-    
-    def test_add_z_score_returns_expanding(self, feature_engineer, sample_returns_data):
-        """Test z-score returns with expanding window."""
-        result = feature_engineer.add_z_score_returns(
-            sample_returns_data, window=20, method="expanding"
-        )
-        
-        assert "z_score_returns" in result.columns
-        assert len(result) == len(sample_returns_data)
-    
-    def test_add_z_score_returns_invalid_method(self, feature_engineer, sample_returns_data):
-        """Test z-score returns with invalid method."""
-        with pytest.raises(ValueError, match="Unsupported z-score method"):
-            feature_engineer.add_z_score_returns(
-                sample_returns_data, window=20, method="invalid"
-            )
-    
-    def test_add_volatility_regime_indicator(self, feature_engineer, sample_returns_data):
-        """Test volatility regime indicator."""
-        # First add volatility
-        data_with_vol = feature_engineer.compute_rolling_volatility(
-            sample_returns_data, window=20
-        )
-        
-        result = feature_engineer.add_volatility_regime_indicator(
-            data_with_vol, quantile_threshold=0.8
-        )
-        
-        assert "high_vol_regime" in result.columns
-        assert result["high_vol_regime"].dtype == int
-        assert set(result["high_vol_regime"].unique()).issubset({0, 1})
-        
-        # High volatility regime should be approximately 20% of observations
-        high_vol_pct = result["high_vol_regime"].mean() * 100
-        assert 15 <= high_vol_pct <= 25  # Allow some tolerance
-    
-    def test_add_volatility_regime_missing_column(self, feature_engineer, sample_returns_data):
-        """Test volatility regime indicator with missing volatility column."""
-        with pytest.raises(KeyError, match="Volatility column 'rolling_std' not found"):
-            feature_engineer.add_volatility_regime_indicator(
-                sample_returns_data, volatility_column="rolling_std"
-            )
-    
-    def test_engineer_features_comprehensive(self, feature_engineer, sample_returns_data):
-        """Test comprehensive feature engineering."""
-        additional_features = ["abs_returns", "negative_returns", "z_score_returns"]
-        
-        result = feature_engineer.engineer_features(
-            sample_returns_data,
-            rolling_window=20,
-            additional_features=additional_features,
-            volatility_method="std",
-            annualize_vol=True
-        )
-        
-        expected_columns = ["rolling_std"] + additional_features
-        for col in expected_columns:
-            assert col in result.columns
-        
-        # Should remove NaN rows
-        assert not result.isna().any().any()
-        assert len(result) < len(sample_returns_data)  # Some rows removed due to NaN
-    
-    def test_engineer_features_with_high_vol_regime(self, feature_engineer, sample_returns_data):
-        """Test feature engineering including high volatility regime."""
-        additional_features = ["abs_returns", "negative_returns", "high_vol_regime"]
-        
-        result = feature_engineer.engineer_features(
-            sample_returns_data,
-            rolling_window=20,
-            additional_features=additional_features
-        )
-        
-        for col in additional_features:
-            assert col in result.columns
-        
-        if "high_vol_regime" in result.columns:
-            assert set(result["high_vol_regime"].unique()).issubset({0, 1})
-    
-    def test_get_feature_names(self, feature_engineer, sample_returns_data):
-        """Test feature name extraction."""
-        # Add some features
-        result = feature_engineer.engineer_features(
-            sample_returns_data,
-            additional_features=["abs_returns", "negative_returns"]
-        )
-        
-        feature_names = feature_engineer.get_feature_names(result)
-        
-        assert "returns" not in feature_names
-        assert "rolling_std" in feature_names
-        assert "abs_returns" in feature_names
-        assert "negative_returns" in feature_names
-    
-    def test_validate_features_valid(self, feature_engineer, sample_returns_data):
-        """Test feature validation with valid features."""
-        result = feature_engineer.engineer_features(
-            sample_returns_data,
-            additional_features=["abs_returns", "negative_returns"]
-        )
-        
-        feature_names = feature_engineer.get_feature_names(result)
-        assert feature_engineer.validate_features(result, feature_names)
-    
-    def test_validate_features_missing_column(self, feature_engineer, sample_returns_data):
-        """Test feature validation with missing column."""
-        result = feature_engineer.engineer_features(sample_returns_data)
-        feature_names = feature_engineer.get_feature_names(result)
-        
-        # Add non-existent column to feature names
-        feature_names.append("nonexistent_column")
-        
-        assert not feature_engineer.validate_features(result, feature_names)
-    
-    def test_validate_features_infinite_values(self, feature_engineer, sample_returns_data):
-        """Test feature validation with infinite values."""
-        result = feature_engineer.engineer_features(sample_returns_data)
-        
-        # Introduce infinite values (only if result is not empty)
-        if len(result) > 0:
-            result.loc[result.index[0], "rolling_std"] = np.inf
-            
-            feature_names = feature_engineer.get_feature_names(result)
-            assert not feature_engineer.validate_features(result, feature_names)
-        else:
-            # If result is empty, create a simple test case
-            test_df = sample_returns_data.copy()
-            test_df['rolling_std'] = 0.01
-            test_df.loc[test_df.index[0], "rolling_std"] = np.inf
-            assert not feature_engineer.validate_features(test_df, ['rolling_std'])
+# ---------------------------------------------------------------------------
+# Shared fixtures
+# ---------------------------------------------------------------------------
+
+@pytest.fixture(scope="module")
+def returns_500():
+    """500 business-day synthetic log-return series."""
+    rng = np.random.default_rng(0)
+    dates = pd.date_range("2015-01-01", periods=500, freq="B")
+    r = pd.Series(rng.normal(0, 0.01, 500), index=dates, name="returns")
+    return r
 
 
-class TestConvenienceFunctions:
-    """Test cases for convenience functions."""
-    
-    def test_engineer_spx_features(self):
-        """Test convenience function for S&P 500 feature engineering."""
-        # Create sample data
-        np.random.seed(42)
-        dates = pd.date_range('2020-01-01', periods=100, freq='D')
-        returns = np.random.normal(0, 0.02, 100)
-        
-        data = pd.DataFrame({
-            'returns': returns
-        }, index=dates)
-        
-        result = engineer_spx_features(
-            data,
-            rolling_window=20,
-            additional_features=["abs_returns", "negative_returns"]
-        )
-        
-        assert "rolling_std" in result.columns
-        assert "abs_returns" in result.columns
-        assert "negative_returns" in result.columns
-        assert len(result) > 0
-    
-    def test_engineer_spx_features_custom_returns_column(self):
-        """Test convenience function with custom returns column."""
-        # Create sample data with custom returns column name
-        np.random.seed(42)
-        dates = pd.date_range('2020-01-01', periods=100, freq='D')
-        returns = np.random.normal(0, 0.02, 100)
-        
-        data = pd.DataFrame({
-            'log_returns': returns
-        }, index=dates)
-        
-        result = engineer_spx_features(
-            data,
-            returns_column="log_returns",
-            additional_features=["abs_returns"]
-        )
-        
-        assert "rolling_std" in result.columns
-        assert "abs_returns" in result.columns
-        assert len(result) > 0
+@pytest.fixture(scope="module")
+def vix_df_500(returns_500):
+    """Synthetic VIX / VIX9D / VIX3M aligned to returns_500."""
+    rng = np.random.default_rng(1)
+    idx = returns_500.index
+    vix   = pd.Series(np.abs(rng.normal(18, 4, len(idx))), index=idx, name="vix")
+    vix9d = vix * rng.uniform(0.90, 1.10, len(idx))
+    vix3m = vix * rng.uniform(0.90, 1.10, len(idx))
+    return pd.DataFrame({"vix": vix, "vix9d": vix9d, "vix3m": vix3m})
 
 
-class TestFeatureEngineerEdgeCases:
-    """Test edge cases and error conditions."""
-    
-    def test_empty_dataframe(self):
-        """Test with empty DataFrame."""
-        engineer = FeatureEngineer()
-        empty_df = pd.DataFrame(columns=['returns'])
-        
-        # Should return empty DataFrame gracefully
-        result = engineer.compute_rolling_volatility(empty_df, window=20)
-        assert len(result) == 0
-        assert 'rolling_std' in result.columns
-    
-    def test_single_row_dataframe(self):
-        """Test with single row DataFrame."""
-        engineer = FeatureEngineer()
-        single_row_df = pd.DataFrame({'returns': [0.01]})
-        
-        # Should handle gracefully
-        result = engineer.compute_rolling_volatility(single_row_df, window=20)
-        assert len(result) == 1
-        assert pd.isna(result["rolling_std"].iloc[0])
-    
-    def test_constant_returns(self):
-        """Test with constant returns (zero volatility)."""
-        engineer = FeatureEngineer()
-        constant_returns_df = pd.DataFrame({
-            'returns': np.ones(100) * 0.01  # Constant 1% returns
-        })
-        
-        result = engineer.compute_rolling_volatility(constant_returns_df, window=20)
-        
-        # Rolling std should be zero for constant returns
-        valid_std = result["rolling_std"].dropna()
-        assert np.allclose(valid_std, 0, atol=1e-10)
-    
-    def test_large_window_size(self):
-        """Test with window size larger than data length."""
-        engineer = FeatureEngineer()
-        small_data = pd.DataFrame({
-            'returns': np.random.normal(0, 0.02, 10)
-        })
-        
-        # Should handle gracefully
-        result = engineer.compute_rolling_volatility(small_data, window=50)
-        assert len(result) == 10
-        assert result["rolling_std"].isna().all()  # All NaN due to large window
+@pytest.fixture(scope="module")
+def prices_500(returns_500):
+    """Synthetic OHLCV prices compatible with Parkinson estimator."""
+    rng = np.random.default_rng(2)
+    idx = returns_500.index
+    close = 100 * np.cumprod(1 + returns_500.values)
+    high  = close * (1 + np.abs(rng.normal(0, 0.005, len(idx))))
+    low   = close * (1 - np.abs(rng.normal(0, 0.005, len(idx))))
+    return pd.DataFrame({"close": close, "high": high, "low": low}, index=idx)
+
+
+# ---------------------------------------------------------------------------
+# FR-06: Multi-horizon volatility
+# ---------------------------------------------------------------------------
+
+class TestMultiHorizonVol:
+
+    def test_columns_present(self, returns_500):
+        mv = multi_horizon_vol(returns_500)
+        for col in ["rv_short", "rv_medium", "rv_long", "vol_ratio"]:
+            assert col in mv.columns, f"Missing column: {col}"
+
+    def test_rv_ordering(self, returns_500):
+        """On any given day, rv_short should exhibit higher variance than rv_long
+        (short-window estimates are noisier). Check mean levels are plausible."""
+        mv = multi_horizon_vol(returns_500).dropna()
+        # rv_long is a smoothed estimate — its values should span a narrower range
+        assert mv["rv_long"].std() < mv["rv_short"].std(), (
+            "rv_long should be smoother (lower std) than rv_short"
+        )
+
+    def test_vol_ratio_positive(self, returns_500):
+        mv = multi_horizon_vol(returns_500).dropna()
+        assert (mv["vol_ratio"] > 0).all(), "vol_ratio must be positive"
+
+    def test_vol_ratio_clipped(self, returns_500):
+        mv = multi_horizon_vol(returns_500).dropna()
+        assert (mv["vol_ratio"] <= 10.0).all(), "vol_ratio should be clipped at 10"
+        assert (mv["vol_ratio"] >= 0.1).all(), "vol_ratio should be clipped at 0.1"
+
+    def test_no_nan_after_warm_up(self, returns_500):
+        """After the 60-day warm-up, no NaN should remain."""
+        mv = multi_horizon_vol(returns_500).iloc[60:]
+        assert not mv.isnull().any().any(), "NaN found after 60-day warm-up"
+
+    def test_annualisation(self, returns_500):
+        """rv_medium (20d std × √252) should be in a plausible annual vol range."""
+        mv = multi_horizon_vol(returns_500).dropna()
+        # Synthetic data has σ=0.01 daily → ~16% annual
+        mean_rv = mv["rv_medium"].mean()
+        assert 0.05 < mean_rv < 0.50, f"rv_medium mean {mean_rv:.3f} out of plausible range"
+
+
+# ---------------------------------------------------------------------------
+# FR-04: Variance Risk Premium
+# ---------------------------------------------------------------------------
+
+class TestVarianceRiskPremium:
+
+    def test_vrp_is_series(self, returns_500, vix_df_500):
+        vrp = variance_risk_premium(returns_500, vix_df_500["vix"])
+        assert isinstance(vrp, pd.Series)
+
+    def test_vrp_name(self, returns_500, vix_df_500):
+        vrp = variance_risk_premium(returns_500, vix_df_500["vix"])
+        assert vrp.name == "vrp"
+
+    def test_vrp_finite_after_dropna(self, returns_500, vix_df_500):
+        vrp = variance_risk_premium(returns_500, vix_df_500["vix"]).dropna()
+        assert np.all(np.isfinite(vrp.values)), "VRP contains non-finite values"
+        assert len(vrp) > 0, "VRP is empty after dropna"
+
+    def test_vrp_formula(self, returns_500, vix_df_500):
+        """Spot-check: VRP = IV² − RV; IV² = (VIX/100)² × 252."""
+        vix = vix_df_500["vix"].reindex(returns_500.index).ffill()
+        rv  = realized_variance_cc(returns_500, window=20)
+        iv2 = (vix / 100.0) ** 2 * 252
+
+        expected = (iv2 - rv).dropna()
+        actual   = variance_risk_premium(returns_500, vix).dropna()
+
+        common = expected.index.intersection(actual.index)
+        pd.testing.assert_series_equal(
+            actual.loc[common].rename("vrp"),
+            expected.loc[common].rename("vrp"),
+            check_names=False,
+            atol=1e-12,
+        )
+
+    def test_vrp_with_lag(self, returns_500, vix_df_500):
+        """lag > 0 should shift RV back, changing VRP values."""
+        vix  = vix_df_500["vix"]
+        vrp0 = variance_risk_premium(returns_500, vix, lag=0).dropna()
+        vrp5 = variance_risk_premium(returns_500, vix, lag=5).dropna()
+        assert not vrp0.equals(vrp5), "lag=5 should produce different VRP than lag=0"
+
+
+# ---------------------------------------------------------------------------
+# FR-05: VIX term structure
+# ---------------------------------------------------------------------------
+
+class TestVIXTermStructure:
+
+    def test_columns_present(self, vix_df_500):
+        ts = vix_term_structure_features(vix_df_500)
+        assert "spot_ratio" in ts.columns
+        assert "term_ratio" in ts.columns
+
+    def test_ratios_positive(self, vix_df_500):
+        ts = vix_term_structure_features(vix_df_500).dropna()
+        assert (ts["spot_ratio"] > 0).all()
+        assert (ts["term_ratio"] > 0).all()
+
+    def test_ratios_clipped(self, vix_df_500):
+        ts = vix_term_structure_features(vix_df_500).dropna()
+        assert (ts["spot_ratio"] >= 0.3).all() and (ts["spot_ratio"] <= 3.0).all()
+        assert (ts["term_ratio"] >= 0.3).all() and (ts["term_ratio"] <= 3.0).all()
+
+    def test_missing_vix9d_returns_nan_spot_ratio(self):
+        """If VIX9D is missing the spot_ratio column should be NaN."""
+        idx = pd.date_range("2020-01-01", periods=50, freq="B")
+        df  = pd.DataFrame({"vix": np.full(50, 20.0), "vix3m": np.full(50, 18.0)}, index=idx)
+        ts  = vix_term_structure_features(df)
+        assert ts["spot_ratio"].isna().all(), "spot_ratio should be NaN when VIX9D is absent"
+
+    def test_backwardation_condition(self):
+        """term_ratio = VIX/VIX3M > 1 signals backwardation (high-vol)."""
+        idx = pd.date_range("2020-01-01", periods=10, freq="B")
+        df  = pd.DataFrame({
+            "vix":   np.full(10, 30.0),   # elevated
+            "vix9d": np.full(10, 28.0),
+            "vix3m": np.full(10, 20.0),   # term_ratio = 30/20 = 1.5
+        }, index=idx)
+        ts = vix_term_structure_features(df)
+        assert (ts["term_ratio"] > 1.0).all(), "term_ratio should be > 1 in backwardation"
+
+
+# ---------------------------------------------------------------------------
+# FR-07: Downside risk & skewness
+# ---------------------------------------------------------------------------
+
+class TestDownsideSkewFeatures:
+
+    def test_columns_present(self, returns_500):
+        ds = downside_skew_features(returns_500)
+        assert "downside_vol" in ds.columns
+        assert "skewness_20d" in ds.columns
+
+    def test_downside_vol_positive(self, returns_500):
+        ds = downside_skew_features(returns_500).dropna()
+        assert (ds["downside_vol"] >= 0).all(), "downside_vol must be non-negative"
+
+    def test_downside_vol_annualised(self, returns_500):
+        """downside_vol should be in a plausible annualised range."""
+        ds = downside_skew_features(returns_500).dropna()
+        mean_dv = ds["downside_vol"].mean()
+        assert 0.02 < mean_dv < 1.0, f"downside_vol mean {mean_dv:.3f} looks implausible"
+
+    def test_skewness_range(self, returns_500):
+        """20-day skewness should be in (-5, 5) for normal-ish data."""
+        ds = downside_skew_features(returns_500).dropna()
+        assert ds["skewness_20d"].abs().max() < 5.0, "skewness_20d has implausibly large value"
+
+    def test_custom_window(self, returns_500):
+        """Window parameter should be respected."""
+        ds10 = downside_skew_features(returns_500, window=10).dropna()
+        ds60 = downside_skew_features(returns_500, window=60).dropna()
+        # 60-day window produces smoother (lower std) downside_vol
+        assert ds60["downside_vol"].std() < ds10["downside_vol"].std()
+
+
+# ---------------------------------------------------------------------------
+# Parkinson estimator
+# ---------------------------------------------------------------------------
+
+class TestParkinsonEstimator:
+
+    def test_returns_series(self, prices_500):
+        rv = realized_variance_parkinson(prices_500)
+        assert isinstance(rv, pd.Series)
+
+    def test_positive_values(self, prices_500):
+        rv = realized_variance_parkinson(prices_500).dropna()
+        assert (rv > 0).all(), "Parkinson RV must be positive"
+
+    def test_name(self, prices_500):
+        rv = realized_variance_parkinson(prices_500)
+        assert rv.name == "rv_parkinson"
+
+    def test_missing_high_low_returns_nan(self):
+        """Without high/low columns the estimator should return all-NaN."""
+        idx = pd.date_range("2020-01-01", periods=30, freq="B")
+        df  = pd.DataFrame({"close": np.ones(30)}, index=idx)
+        rv  = realized_variance_parkinson(df)
+        assert rv.isna().all(), "Expected all-NaN when high/low are absent"
+
+
+# ---------------------------------------------------------------------------
+# Realised variance close-to-close
+# ---------------------------------------------------------------------------
+
+class TestRealisedVarianceCC:
+
+    def test_non_negative(self, returns_500):
+        rv = realized_variance_cc(returns_500, window=20).dropna()
+        assert (rv >= 0).all()
+
+    def test_window_respected(self, returns_500):
+        """With window=20, first 19 values must be NaN."""
+        rv = realized_variance_cc(returns_500, window=20)
+        assert rv.iloc[:19].isna().all()
+        assert rv.iloc[19:].notna().any()
+
+    def test_annualisation(self, returns_500):
+        rv = realized_variance_cc(returns_500, window=20).dropna()
+        # σ=0.01 daily → RV ≈ 252 × 0.01² = 0.0252
+        mean_rv = rv.mean()
+        assert 0.005 < mean_rv < 0.15, f"RV mean {mean_rv:.5f} looks implausible"
+
+
+# ---------------------------------------------------------------------------
+# build_features — tier system  (FR-04 to FR-07 integration)
+# ---------------------------------------------------------------------------
+
+class TestBuildFeatures:
+
+    def test_tier1_columns(self, returns_500):
+        """Tier 1 must include rv_short/medium/long + vol_ratio."""
+        features = build_features(returns_500)
+        for col in ["rv_short", "rv_medium", "rv_long", "vol_ratio"]:
+            assert col in features.columns, f"Tier-1 col missing: {col}"
+
+    def test_tier2_columns(self, returns_500, vix_df_500):
+        """Tier 2 adds vrp, spot_ratio, term_ratio, downside_vol."""
+        features = build_features(returns_500, vix_df=vix_df_500)
+        for col in ["vrp", "spot_ratio", "term_ratio", "downside_vol"]:
+            assert col in features.columns, f"Tier-2 col missing: {col}"
+
+    def test_tier3_columns(self, returns_500, vix_df_500, prices_500):
+        """Tier 3 adds rv_parkinson + skewness_20d."""
+        features = build_features(returns_500, prices=prices_500, vix_df=vix_df_500)
+        for col in ["rv_parkinson", "skewness_20d"]:
+            assert col in features.columns, f"Tier-3 col missing: {col}"
+
+    def test_no_nan_in_output(self, returns_500, vix_df_500):
+        features = build_features(returns_500, vix_df=vix_df_500)
+        assert not features.isnull().any().any(), "build_features output contains NaN"
+
+    def test_no_inf_in_output(self, returns_500, vix_df_500):
+        features = build_features(returns_500, vix_df=vix_df_500)
+        assert not np.isinf(features.values).any(), "build_features output contains Inf"
+
+    def test_returns_column_present(self, returns_500):
+        features = build_features(returns_500)
+        assert "returns" in features.columns
+
+    def test_index_is_datetimeindex(self, returns_500):
+        features = build_features(returns_500)
+        assert isinstance(features.index, pd.DatetimeIndex)
+
+    def test_shape_shrinks_from_warmup(self, returns_500):
+        """build_features must drop warm-up rows (60d max)."""
+        features = build_features(returns_500)
+        assert len(features) < len(returns_500)
+
+
+class TestGetFeatureCols:
+
+    def test_tier1_subset(self, returns_500):
+        features = build_features(returns_500)
+        cols = get_feature_cols(features, tier=1)
+        assert set(cols) == {"rv_short", "rv_medium", "rv_long", "vol_ratio"}
+
+    def test_tier2_superset_of_tier1(self, returns_500, vix_df_500):
+        features = build_features(returns_500, vix_df=vix_df_500)
+        t1 = set(get_feature_cols(features, tier=1))
+        t2 = set(get_feature_cols(features, tier=2))
+        assert t1.issubset(t2), "Tier-2 should be a superset of Tier-1"
+
+    def test_missing_cols_excluded(self, returns_500):
+        """If VIX data is absent, tier=2 request should silently drop VIX cols."""
+        features = build_features(returns_500)   # no vix_df
+        cols = get_feature_cols(features, tier=2)
+        for c in ["vrp", "spot_ratio", "term_ratio"]:
+            assert c not in cols, f"VIX col {c} should not appear without vix_df"
+
+    def test_cols_are_subset_of_df_columns(self, returns_500, vix_df_500):
+        features = build_features(returns_500, vix_df=vix_df_500)
+        for tier in [1, 2, 3]:
+            cols = get_feature_cols(features, tier=tier)
+            for c in cols:
+                assert c in features.columns, f"Column {c} in tier={tier} not in DataFrame"
